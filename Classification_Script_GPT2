@@ -1,0 +1,379 @@
+# Text Classification using fine-tuned GPT-2 model
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1dMTdO5vxdVX0NA2Qe7AV9WGEy8ZH67Xn?usp=sharing) &nbsp;[![Generic badge](https://img.shields.io/badge/GitHub-Source-greensvg)](https://github.com/haocai1992/GPT2-News-Classifier/blob/main/colab-train/gpt2-news-classifier-colab-train.ipynb)
+
+This notebook demonstrates how to use a pre-trained GPT-2 model from [HuggingFace](https://huggingface.co/transformers/) to perform text classification task.
+
+Both BERT and GPT-2 are state-of-the-art transformer models (less "SOTA" now in 2022, with emergence of GPT-3 and other new ones...) that has phenomenal performance in many NLP tasks. One big difference between these two is that GPT-2 was built using decoder blocks, while BERT uses encoder blocks. Therefore, GPT-2 is mostly used in text-generation tasks. Unlike BERT, I couldn't find a lot of articles/tech blogs talking about using GPT-2 for **text classification** tasks. That's why I want to try that out here!
+
+The **main idea** is this: Since GPT2 is a decoder transformer, the last token of the input sequence is used to make predictions about the next token that should follow the input. This means that the last token of the input sequence can be used to for predictions in a classification task too.
+
+## Install and import packages
+
+!pip install torch
+!pip3 install pandas
+!pip3 install numpy
+!pip3 install sklearn
+!pip3 install tqdm
+!pip3 install transformers
+
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+
+from google.colab import drive
+from torch import nn
+from torch.optim import Adam
+from transformers import GPT2Model, GPT2Tokenizer
+from tqdm import tqdm
+
+from sklearn.metrics import confusion_matrix
+from sklearn.metrics import ConfusionMatrixDisplay
+
+## Setup Google Drive
+
+drive.mount('/content/drive/')
+
+%cd /content/drive/My Drive/GPT2-News-Classifier/
+
+## Read data
+
+The dataset we are going to use in this notebook is the *[BBC News Classification dataset](http://mlg.ucd.ie/datasets/bbc.html)*. You can download the dataset in [Kaggle](https://www.kaggle.com/c/learn-ai-bbc/data).
+
+import pandas as pd
+
+#file_path = '/content/drive/MyDrive/hicks_personal_training_06292023.csv'
+file_path = '/content/drive/MyDrive/elsabry_largecat_training_balanced_06222023.csv'
+
+df = pd.read_csv(file_path, encoding = "ISO-8859-1")
+
+df = pd.read_csv('./data/bbc-text.csv')
+# df = pd.read_csv('./data/bbc-text-small.csv') # smaller dataset to save training time.
+
+This dataset is in CSV format and it has 2126 different texts, each labeled under one of 8 categories: entertainment, sport, tech, business, or politics. It has two columns, **hicks_personal** which will be the label; and **text** which will be our input data for GPT-2.
+
+df.head()
+
+df.groupby("ElSabry_LargeCat").size().plot.bar()
+
+## Preprocessing data (text tokenization)
+
+We need to tokenize the input text in order to feed GPT-2 model with its expected data format. This can be easily done using HuggingFace Transformers' GPT2Tokenizer object. However, unlike BERT which does padding to the right, for GPT-2 we need to do padding to the left, because we need to use the last token for prediction. Therefore we need to adapt GPT2Tokenizer after calling.
+
+tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+tokenizer.padding_side = "left"
+tokenizer.pad_token = tokenizer.eos_token
+
+example_text = "I will watch Memento tonight"
+gpt2_input = tokenizer(example_text, padding="max_length", max_length=10, truncation=True, return_tensors="pt")
+
+print(gpt2_input['input_ids'])
+
+print(gpt2_input["attention_mask"])
+
+example_text = tokenizer.decode(gpt2_input.input_ids[0])
+print(example_text)
+
+## Dataset class
+
+PyTorch provides a very convenient way to construct cusom Dataset class to facilitate model training. See more details [here](https://pytorch.org/tutorials/beginner/basics/data_tutorial.html). Here we will build a custom Dataset class to read in our news data, tokenize them, and store them into containers for batch training.
+
+tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+tokenizer.padding_side = "left"
+tokenizer.pad_token = tokenizer.eos_token
+#labels = {
+#   'retired': 0,
+#   'serious leisure': 1,
+#   'personal':2,
+#    'chronic illness':3,
+#    'family':4,
+#    'Job Transition':5,
+#    'improve skills':6,
+#     'veteran':7
+#         }
+
+labels = {
+
+      'Academic': 0,
+      'Evidence-Based Practice': 1,
+      'Extramural Research':2,
+      'Personal Use': 3,
+      'None': 4
+}
+
+class Dataset(torch.utils.data.Dataset):
+    def __init__(self, df):
+        self.labels = [labels[label] for label in df['ElSabry_LargeCat']]
+        self.texts = [tokenizer(story,
+                                padding='max_length',
+                                max_length=256,
+                                truncation=True,
+                                return_tensors="pt") for story in df['story']]
+
+    def classes(self):
+        return self.labels
+
+    def __len__(self):
+        return len(self.labels)
+
+    def get_batch_labels(self, idx):
+        # Get a batch of labels
+        return np.array(self.labels[idx])
+
+    def get_batch_texts(self, idx):
+        # Get a batch of inputs
+        return self.texts[idx]
+
+    def __getitem__(self, idx):
+        batch_texts = self.get_batch_texts(idx)
+        batch_y = self.get_batch_labels(idx)
+        return batch_texts, batch_y
+
+## Split training-test dataset
+
+One more thing to do before we start with models. We need to split train, validation and test data as separate dataframes. Numpy's split function can do just that.
+
+np.random.seed(123)
+df_train, df_val, df_test = np.split(df.sample(frac=1, random_state=35),
+                                     [int(0.8*len(df)), int(0.9*len(df))])
+
+print(len(df_train), len(df_val), len(df_test))
+
+## Model building
+
+Now comes to the most important part of this notebook. We need to buid a classifier model on top of a pre-trained GPT-2 model. The trick here is to add a linear layer on top of GPT-2's 12 layers of decoders with its output dimension equals our number of labels. In this way we can use GPT-2 to output 8 numbers which corresponds to our five news categories!
+
+For more information about how to build customized models in PyTorch, see [here](https://pytorch.org/tutorials/beginner/basics/buildmodel_tutorial.html).
+
+class SimpleGPT2SequenceClassifier(nn.Module):
+    def __init__(self, hidden_size: int, num_classes:int ,max_seq_len:int, gpt_model_name:str):
+        super(SimpleGPT2SequenceClassifier,self).__init__()
+        self.gpt2model = GPT2Model.from_pretrained(gpt_model_name)
+        self.fc1 = nn.Linear(hidden_size*max_seq_len, num_classes)
+
+
+    def forward(self, input_id, mask):
+        """
+        Args:
+                input_id: encoded inputs ids of sent.
+        """
+        gpt_out, _ = self.gpt2model(input_ids=input_id, attention_mask=mask, return_dict=False)
+        batch_size = gpt_out.shape[0]
+        linear_output = self.fc1(gpt_out.view(batch_size,-1))
+        return linear_output
+
+len(df)
+
+df = df.dropna() # dropped 3 observations (1596 to 1593)
+
+len(df)
+
+## Training loop
+
+Now it's time to train (fine-tune) our model! Here I build a standard PyTorch training loop following [this guide](https://pytorch.org/tutorials/beginner/basics/optimization_tutorial.html). Since this is a multi-class classification problem, I picked [cross-entropy-loss](https://pytorch.org/docs/stable/generated/torch.nn.CrossEntropyLoss.html) as our loss function ("criterion"), and [Adam](https://pytorch.org/docs/stable/generated/torch.optim.Adam.html) as the optimization algorithm.
+
+def train(model, train_data, val_data, learning_rate, epochs):
+    train, val = Dataset(train_data), Dataset(val_data)
+
+    train_dataloader = torch.utils.data.DataLoader(train, batch_size=2, shuffle=True)
+    val_dataloader = torch.utils.data.DataLoader(val, batch_size=2)
+
+    use_cuda = torch.cuda.is_available()
+    device = torch.device("cuda" if use_cuda else "cpu")
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = Adam(model.parameters(), lr=learning_rate)
+
+    if use_cuda:
+        model = model.cuda()
+        criterion = criterion.cuda()
+
+    for epoch_num in range(epochs):
+        total_acc_train = 0
+        total_loss_train = 0
+
+        for train_input, train_label in tqdm(train_dataloader):
+            train_label = train_label.to(device)
+            mask = train_input['attention_mask'].to(device)
+            input_id = train_input["input_ids"].squeeze(1).to(device)
+
+            model.zero_grad()
+
+            output = model(input_id, mask)
+
+            batch_loss = criterion(output, train_label)
+            total_loss_train += batch_loss.item()
+
+            acc = (output.argmax(dim=1)==train_label).sum().item()
+            total_acc_train += acc
+
+            batch_loss.backward()
+            optimizer.step()
+
+        total_acc_val = 0
+        total_loss_val = 0
+
+        with torch.no_grad():
+
+            for val_input, val_label in val_dataloader:
+                val_label = val_label.to(device)
+                mask = val_input['attention_mask'].to(device)
+                input_id = val_input['input_ids'].squeeze(1).to(device)
+
+                output = model(input_id, mask)
+
+                batch_loss = criterion(output, val_label)
+                total_loss_val += batch_loss.item()
+
+                acc = (output.argmax(dim=1)==val_label).sum().item()
+                total_acc_val += acc
+
+            print(
+            f"Epochs: {epoch_num + 1} | Train Loss: {total_loss_train/len(train_data): .3f} \
+            | Train Accuracy: {total_acc_train / len(train_data): .3f} \
+            | Val Loss: {total_loss_val / len(val_data): .3f} \
+            | Val Accuracy: {total_acc_val / len(val_data): .3f}")
+
+EPOCHS = 8
+model = SimpleGPT2SequenceClassifier(hidden_size=768, num_classes=5, max_seq_len=256, gpt_model_name="gpt2")
+LR = 1e-3
+
+train(model, df_train, df_val, LR, EPOCHS)
+
+Looks like the model is already well trained after 1 epoch! This is probably due to the fact that as a pre-trained model with gigantic number of parameters, GPT-2 is already capable of differentiating different text paragraphs without too much tuning.
+
+## Evaluation
+
+After model training, it's recommended to use the test data to evaluate the model performance on unseen data. I build the `evaluate` function according [this PyTorch guide](https://pytorch.org/tutorials/beginner/basics/optimization_tutorial.html).
+
+def evaluate(model, test_data):
+
+    test = Dataset(test_data)
+
+    test_dataloader = torch.utils.data.DataLoader(test, batch_size=2)
+
+    use_cuda = torch.cuda.is_available()
+    device = torch.device("cuda" if use_cuda else "cpu")
+
+    if use_cuda:
+
+        model = model.cuda()
+
+
+    # Tracking variables
+    predictions_labels = []
+    true_labels = []
+
+    total_acc_test = 0
+    with torch.no_grad():
+
+        for test_input, test_label in test_dataloader:
+
+            test_label = test_label.to(device)
+            mask = test_input['attention_mask'].to(device)
+            input_id = test_input['input_ids'].squeeze(1).to(device)
+
+            output = model(input_id, mask)
+
+            acc = (output.argmax(dim=1) == test_label).sum().item()
+            total_acc_test += acc
+
+            # add original labels
+            true_labels += test_label.cpu().numpy().flatten().tolist()
+            # get predicitons to list
+            predictions_labels += output.argmax(dim=1).cpu().numpy().flatten().tolist()
+
+    print(f'Test Accuracy: {total_acc_test / len(test_data): .3f}')
+    return true_labels, predictions_labels
+
+true_labels, pred_labels = evaluate(model, df_test)
+
+Another good gauge of model performance is the confusion matrix.
+
+# Plot confusion matrix.
+fig, ax = plt.subplots(figsize=(8, 8))
+cm = confusion_matrix(y_true=true_labels, y_pred=pred_labels, labels=range(len(labels)), normalize='true')
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=list(labels.keys()))
+disp.plot(ax=ax)
+
+## Saving and loading the model
+
+After training, we need to save the model locally. PyTorch models store the learned parameters in an internal state dictionary, called state_dict. These can be persisted via the torch.save method:
+
+# save trained model
+# torch.save(model.state_dict(), "./model/gpt2-text-classifier-model.pt")
+
+#torch.save(model.state_dict(), "gpt2-text-classifier.pt")
+torch.save(model.state_dict(), "gpt2-text-classifier_ElSabry.pt")
+
+To load model weights, you need to create an instance of the same model first, and then load the parameters using load_state_dict() method.
+
+# load trained model
+model_new = SimpleGPT2SequenceClassifier(hidden_size=768, num_classes=5, max_seq_len=256, gpt_model_name="gpt2")
+model_new.load_state_dict(torch.load("gpt2-text-classifier_ElSabry.pt"))
+model_new.eval()
+
+## Model Inference
+
+Here we want to use the model to generate inferences. Here we use a clipped news from [BBC Politics](https://www.bbc.com/news/uk-60095459) as an example.
+
+example_text = """
+
+I am a doctor and looking for the best available evidence.
+
+"""
+fixed_text = " ".join(example_text.lower().split())
+print(fixed_text)
+
+tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+tokenizer.padding_side = "left"
+tokenizer.pad_token = tokenizer.eos_token
+
+model_input = tokenizer(fixed_text, padding='max_length', max_length=256, truncation=True, return_tensors="pt")
+
+After text tokenization, we need to extract two inputs for the model, `input_id` and `mask`.
+
+mask = model_input['attention_mask'].cpu()
+input_id = model_input["input_ids"].squeeze(1).cpu()
+
+output = model_new(input_id, mask)
+
+print(output)
+
+The output here is the model output for each label. We can normalize them as probabilities using Softmax algorithm.
+
+prob = torch.nn.functional.softmax(output, dim=1)[0]
+
+print(prob)
+
+Let's see if our predictor can correctly classify this news as "politics".
+
+#labels_map = {
+#    0: "retired",
+#    1: "serious leisure",
+#    2: "personal",
+#    3: "chronic illness",
+#    4: "family",
+#    5: "Job Transition",
+#    6: "improve skills",
+#    7: "veteran"
+#         }
+
+labels_map = {
+    0: "Academic",
+    1: "Evidence-Based Research",
+    2: "Extramural Research",
+    3: "Personal Use",
+    4: "None"
+}
+
+pred_label = labels_map[output.argmax(dim=1).item()]
+print(pred_label)
+
+It can!
+
+## Clear cache
+
+If you are using PyTorch's CUDA version, remember to clear cache after running this notebook to avoid re-run issues.
+
+# torch.cuda.empty_cache()
