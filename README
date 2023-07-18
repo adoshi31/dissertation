@@ -1,0 +1,20 @@
+RQ1 - Interrupted Time Series Analysis
+
+The interrupted time series adapts R code from https://ds4ps.org/pe4ps-textbook/docs/index.html
+Foundations of Program Evaluation: Regression Tools for Impact Analysis (Jesse Lecy, PhD and Federica Fusi, PhD)
+
+Note that Data cleaning and daily download aggregation steps are conducted in R and Excel 
+
+RQ2 - Cleaning data for BERT analysis using Excel, R and Python 
+
+Excel is used to isolate specific category types for analysis (e.g. Extramural research per ElSabry typology, for example). 
+
+R is then used to clean comments by standard data cleaning steps including removing whitespaces, trailing spaces, lowercasing. 
+Then, in Excel, I add quotations and comma to each comment using the following macros:
+  =CHAR(34)&A1&CHAR(34)  ADDING QUOTES AROUND COMMENT
+  =A1&","                ADDING COMMA AT END OF COMMENT
+
+Then, the comments are copied and pasted into TextEdit. In TextEdit, I "select all" copy and then paste into the
+appropriate list to predict categorical classification in the Python code (near bottom of script). 
+
+                                                
